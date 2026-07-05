@@ -1,11 +1,14 @@
-#requires -version 5.1
+﻿#requires -version 5.1
 <#
 .SYNOPSIS
     Startpunkt fuer das Tool "DHCP MAC-Reservierung".
 
 .DESCRIPTION
-    Laedt Settings, Services und die WinForms-Oberflaeche.
-    Zielsystem: Windows Server 2022 Standard mit DHCP-Server-RSAT/Modul.
+    Laedt Settings, Services und die WinForms-Oberflaeche des Projekts.
+
+.NOTES
+    Projekt: DHCP MAC-Reservierung
+    Umgebung: Windows Server 2022 / Windows PowerShell 5.1
 #>
 
 [CmdletBinding()]

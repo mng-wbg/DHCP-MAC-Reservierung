@@ -1,6 +1,14 @@
-<#
+﻿<#
 .SYNOPSIS
-    DHCP-Service fuer Reservierungen und MAC-Filter.
+    DHCP-Reservierungen und Filter fuer MAC-Listen.
+
+.DESCRIPTION
+    Fuehrt Reservierungen aus, prueft/aktualisiert vorhandene DHCP-Eintraege und
+    setzt Statuswerte in der CSV. Der Status dient als Protokoll pro Eintrag.
+
+.NOTES
+    Projekt: DHCP MAC-Reservierung
+    Umgebung: Windows Server 2022 / Windows PowerShell 5.1
 #>
 
 Import-Module DhcpServer -ErrorAction SilentlyContinue
@@ -67,6 +75,102 @@ function Add-DhcpV4ReservationSafe {
     Add-DhcpServerv4Reservation @params
 }
 
+function Convert-IPv4AddressToUInt32 {
+    param([Parameter(Mandatory)] [System.Net.IPAddress]$IPAddress)
+
+    $bytes = $IPAddress.GetAddressBytes()
+    if ($bytes.Length -ne 4) {
+        throw 'Nur IPv4-Adressen werden unterstuetzt.'
+    }
+
+    if ([BitConverter]::IsLittleEndian) {
+        [Array]::Reverse($bytes)
+    }
+
+    return [BitConverter]::ToUInt32($bytes, 0)
+}
+
+function Convert-UInt32ToIPv4String {
+    param([Parameter(Mandatory)] [uint32]$Value)
+
+    $bytes = [BitConverter]::GetBytes($Value)
+    if ([BitConverter]::IsLittleEndian) {
+        [Array]::Reverse($bytes)
+    }
+
+    return ('{0}.{1}.{2}.{3}' -f $bytes[0], $bytes[1], $bytes[2], $bytes[3])
+}
+
+function Get-NextFreeIpInRange {
+    <#
+    .SYNOPSIS
+        Ermittelt die naechste freie IPv4-Adresse in einem Bereich.
+
+    .DESCRIPTION
+        Der Bereich stammt aus den organisatorischen Areas und begrenzt nur
+        Vorschlaege bzw. Validierung. Der DHCP-Scope selbst bleibt global.
+
+    .PARAMETER StartIp
+        Untere IP-Grenze des vorgeschlagenen Bereichs.
+
+    .PARAMETER EndIp
+        Obere IP-Grenze des vorgeschlagenen Bereichs.
+
+    .PARAMETER UsedIps
+        Sammlung bereits belegter IPv4-Adressen.
+
+    .OUTPUTS
+        System.String
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$StartIp,
+        [Parameter(Mandatory)] [string]$EndIp,
+        [Parameter(Mandatory)] $UsedIps
+    )
+
+    $startIpAddress = $null
+    if (-not [System.Net.IPAddress]::TryParse($StartIp, [ref]$startIpAddress)) {
+        throw "Ungueltige Start-IP: $StartIp"
+    }
+
+    $endIpAddress = $null
+    if (-not [System.Net.IPAddress]::TryParse($EndIp, [ref]$endIpAddress)) {
+        throw "Ungueltige End-IP: $EndIp"
+    }
+
+    if ($startIpAddress.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
+        $endIpAddress.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        throw 'Nur IPv4-Adressen werden unterstuetzt.'
+    }
+
+    $startValue = Convert-IPv4AddressToUInt32 -IPAddress $startIpAddress
+    $endValue = Convert-IPv4AddressToUInt32 -IPAddress $endIpAddress
+
+    if ($startValue -gt $endValue) {
+        throw 'Start-IP muss kleiner oder gleich End-IP sein.'
+    }
+
+    for ($value = $startValue; $value -le $endValue; $value++) {
+        $candidate = Convert-UInt32ToIPv4String -Value ([uint32]$value)
+
+        $isUsed = $false
+        if ($null -ne $UsedIps) {
+            try {
+                $isUsed = [bool]$UsedIps.Contains($candidate)
+            }
+            catch {
+                $isUsed = $UsedIps -contains $candidate
+            }
+        }
+
+        if (-not $isUsed) {
+            return $candidate
+        }
+    }
+
+    return $null
+}
+
 function Set-DhcpV4ReservationSafe {
     param(
         [Parameter(Mandatory)] [string]$ComputerName,
@@ -89,18 +193,45 @@ function Set-DhcpV4ReservationSafe {
 }
 
 function Invoke-DhcpMacReservations {
+    <#
+    .SYNOPSIS
+        Fuehrt DHCP-Reservierungen fuer alle gueltigen Tabellenzeilen aus.
+
+    .DESCRIPTION
+        Schreibt Statuswerte im Format LEVEL | yyyy-MM-dd HH:mm:ss | Meldung in die
+        Status-Spalte der Arbeits-CSV. Statuswerte sind das einzige Protokoll pro Zeile.
+
+        Der DHCP-Scope wird global aus Settings.DhcpScope verwendet, weil das Projekt
+        mit einem gemeinsamen /16-Scope arbeitet. Areas sind nur organisatorische
+        Start-/Endbereiche fuer Vorschlaege und Validierung.
+
+    .PARAMETER Table
+        Tabelle oder normale DataSource mit MAC- und IP-Daten.
+
+    .PARAMETER Settings
+        Projektweite Einstellungen inkl. globalem DHCP-Scope.
+
+    .PARAMETER StatusCallback
+        Rueckruffunktion fuer Statusmeldungen im GUI.
+
+    .OUTPUTS
+        PSCustomObject mit Processed, Errors und DhcpServer.
+    #>
     param(
-        [Parameter(Mandatory)] [System.Data.DataTable]$Table,
+        [Parameter(Mandatory)] [object]$Table,
         [Parameter(Mandatory)] [hashtable]$Settings,
-        [Parameter(Mandatory)] [string]$Scope,
         [Parameter(Mandatory)] [scriptblock]$StatusCallback
     )
 
-    $nowStamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $targetTable = @(Resolve-DataTableFromDataSource -DataSource $Table)[0]
+    if (-not ($targetTable -is [System.Data.DataTable])) {
+        throw "Table ist keine DataTable, sondern: $($targetTable.GetType().FullName)"
+    }
+
     $processed = 0
     $errors = 0
 
-    $scopeId = [System.Net.IPAddress]$Scope
+    $scopeId = [System.Net.IPAddress]$Settings.DhcpScope
     $scopeIdStr = $scopeId.ToString()
 
     $dhcpServer = Resolve-DhcpServerName -Settings $Settings
@@ -112,7 +243,7 @@ function Invoke-DhcpMacReservations {
 
     $reservationsAll = @(Get-DhcpServerv4Reservation -ComputerName $dhcpServer -ScopeId $scopeIdStr -ErrorAction SilentlyContinue)
 
-    foreach ($row in $Table.Rows) {
+    foreach ($row in $targetTable.Rows) {
         if ($row.RowState -eq [System.Data.DataRowState]::Deleted) { continue }
 
         $name   = ([string]$row['Description']).Trim()
@@ -120,11 +251,11 @@ function Invoke-DhcpMacReservations {
         $ipStr  = ([string]$row['IPAddress']).Trim()
         $macRaw = ([string]$row['MACAddress']).Trim()
 
-        $macNorm = Normalize-Mac -Mac $macRaw
+        $macNorm = ConvertTo-NormalizedMac -Mac $macRaw
         $macHyphen = Format-MacHyphen -Mac $macRaw
 
         if (-not $macNorm -or $macNorm.Length -ne 12) {
-            $row['Status'] = "Fehler: Ungueltige MAC '$macRaw' | $nowStamp"
+            $row['Status'] = New-MacListStatus -Level 'FEHLER' -Message "MAC-Adresse ungültig: $macRaw"
             $errors++
             continue
         }
@@ -184,11 +315,11 @@ function Invoke-DhcpMacReservations {
 
             $filterMsg = Add-DhcpMacFilterIfMissing -Settings $Settings -MacAddress $macHyphen -MacNorm $macNorm -Description $name
 
-            $row['Status'] = "OK: $actionMsg | $filterMsg | $nowStamp"
+            $row['Status'] = New-MacListStatus -Level 'OK' -Message "$actionMsg | $filterMsg"
             $processed++
         }
         catch {
-            $row['Status'] = "Fehler: $($_.Exception.Message) | $nowStamp"
+            $row['Status'] = New-MacListStatus -Level 'FEHLER' -Message $_.Exception.Message
             $errors++
         }
     }
@@ -201,6 +332,13 @@ function Invoke-DhcpMacReservations {
 }
 
 function Add-DhcpMacFilterIfMissing {
+    <#
+    .SYNOPSIS
+        Stellt sicher, dass ein MAC-Filter vorhanden ist.
+
+    .OUTPUTS
+        System.String
+    #>
     param(
         [Parameter(Mandatory)] [hashtable]$Settings,
         [Parameter(Mandatory)] [string]$MacAddress,
@@ -217,7 +355,7 @@ function Add-DhcpMacFilterIfMissing {
 
     try {
         $existingFilter = Get-DhcpServerv4Filter -ComputerName $filterServer -List $filterListName -ErrorAction SilentlyContinue |
-            Where-Object { (Normalize-Mac -Mac $_.MacAddress) -eq $MacNorm }
+            Where-Object { (ConvertTo-NormalizedMac -Mac $_.MacAddress) -eq $MacNorm }
 
         if (-not $existingFilter) {
             $filterParams = @{
